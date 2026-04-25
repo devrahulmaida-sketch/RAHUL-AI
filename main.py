@@ -55,8 +55,8 @@ def get_base_dir():
 BASE_DIR       = get_base_dir()
 API_CONFIG     = BASE_DIR / "config" / "api_keys.json"
 PROMPT_PATH    = BASE_DIR / "core"   / "prompt.txt"
-LIVE_MODEL     = "models/gemini-2.5-flash-preview-native-audio-dialog"
-FALLBACK_MODEL = "gemini-2.5-flash"
+LIVE_MODEL     = "gemini-2.0-flash-live-001"
+FALLBACK_MODEL = "gemini-2.0-flash"
 CTRL_RE        = re.compile(r"<ctrl\d+>", re.IGNORECASE)
 
 
@@ -448,9 +448,7 @@ class RahulCore:
         if not self._loop or not self.session:
             return
         asyncio.run_coroutine_threadsafe(
-            self.session.send_client_content(
-                turns={"parts": [{"text": text}]}, turn_complete=True
-            ),
+            self.session.send_message(text),
             self._loop,
         )
 
@@ -472,17 +470,14 @@ class RahulCore:
 
         modalities = ["TEXT"]
         if self._audio_enabled:
-            modalities = ["AUDIO"]
+            modalities = ["AUDIO", "TEXT"]
 
         cfg = types.LiveConnectConfig(
             response_modalities=modalities,
             system_instruction="\n".join(filter(None, parts)),
             tools=[{"function_declarations": TOOLS}],
-            session_resumption=types.SessionResumptionConfig(),
         )
         if self._audio_enabled:
-            cfg.output_audio_transcription = {}
-            cfg.input_audio_transcription  = {}
             cfg.speech_config = types.SpeechConfig(
                 voice_config=types.VoiceConfig(
                     prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Puck")
@@ -651,22 +646,29 @@ class RahulCore:
                     await self.session.send_tool_response(function_responses=frs)
 
     async def _receive_text(self):
-        """Text-only mode receiver."""
+        """Text-only mode receiver for Gemini Live API."""
         out_buf = []
         while True:
             async for resp in self.session.receive():
+                # Handle text parts
                 if resp.server_content:
                     sc = resp.server_content
+                    # model_turn contains the actual response parts
                     if sc.model_turn:
                         for part in sc.model_turn.parts:
-                            if hasattr(part, "text") and part.text:
-                                out_buf.append(_clean(part.text))
+                            txt = getattr(part, "text", None)
+                            if txt:
+                                out_buf.append(_clean(txt))
                     if sc.turn_complete:
-                        if self._turn_ev: self._turn_ev.set()
+                        if self._turn_ev:
+                            self._turn_ev.set()
                         if out_buf:
-                            self.ui.write_log(f"RAHUL: {' '.join(out_buf).strip()}")
+                            full = " ".join(out_buf).strip()
+                            if full:
+                                self.ui.write_log(f"RAHUL: {full}")
                             out_buf = []
 
+                # Handle tool calls
                 if resp.tool_call:
                     frs = []
                     for fc in resp.tool_call.function_calls:
@@ -698,7 +700,7 @@ class RahulCore:
     # ── Main run loop ──────────────────────────────────────────────────────────
     async def run(self):
         client = genai.Client(api_key=_get_api_key(),
-                               http_options={"api_version": "v1beta"})
+                               http_options={"api_version": "v1alpha"})
         while True:
             try:
                 print("[RAHUL] Connecting to Gemini…")
