@@ -420,320 +420,257 @@ TOOLS = [
 
 
 class RahulCore:
-    """Core AI engine — manages Gemini Live session + tool execution."""
+    """
+    Core AI engine using Gemini REST API (generateContent) with function calling.
+    Works 100% on free tier — no Live API needed.
+    """
+
+    MODEL = "gemini-2.0-flash"   # Free tier, always available
 
     def __init__(self, ui: RahulUI):
-        self.ui       = ui
-        self.session  = None
-        self._loop    = None
-        self.audio_q  = None
-        self.out_q    = None
-        self._turn_ev = None
-        self._is_speaking = False
-        self._speak_lock  = threading.Lock()
+        self.ui            = ui
+        self._history      = []   # multi-turn conversation history
+        self._lock         = threading.Lock()
+        self._ready        = False
         self.ui.on_text_command = self._on_text_command
-        self._audio_enabled = False
 
-        # Try to import sounddevice for optional audio
-        try:
-            import sounddevice as sd
-            self._sd = sd
-            self._audio_enabled = True
-            self.ui.write_log("SYS: Audio input/output available.")
-        except Exception:
-            self._sd = None
-            self.ui.write_log("SYS: No audio — typing-only mode active.")
-
-    def _on_text_command(self, text: str):
-        if not self._loop or not self.session:
-            return
-        asyncio.run_coroutine_threadsafe(
-            self.session.send_message(text),
-            self._loop,
-        )
-
-    def speak_error(self, tool_name: str, error):
-        short = str(error)[:120]
-        self.ui.write_log(f"ERR: {tool_name} — {short}")
-
-    def _build_config(self) -> types.LiveConnectConfig:
+    # ── Build system prompt ────────────────────────────────────────────────────
+    def _system_prompt(self) -> str:
         memory  = load_memory()
         mem_str = format_memory_for_prompt(memory)
         prompt  = _load_prompt()
         now     = datetime.now().strftime("%A, %d %B %Y — %I:%M %p")
+        parts   = [f"[CURRENT DATE & TIME]\n{now}\n",
+                   mem_str if mem_str else "", prompt]
+        return "\n".join(filter(None, parts))
 
-        parts = [
-            f"[CURRENT DATE & TIME]\n{now}\n",
-            mem_str if mem_str else "",
-            prompt,
-        ]
-
-        modalities = ["TEXT"]
-        if self._audio_enabled:
-            modalities = ["AUDIO", "TEXT"]
-
-        cfg = types.LiveConnectConfig(
-            response_modalities=modalities,
-            system_instruction="\n".join(filter(None, parts)),
-            tools=[{"function_declarations": TOOLS}],
-        )
-        if self._audio_enabled:
-            cfg.speech_config = types.SpeechConfig(
-                voice_config=types.VoiceConfig(
-                    prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Puck")
+    # ── Convert our TOOLS list → Gemini SDK format ─────────────────────────────
+    @staticmethod
+    def _sdk_tools():
+        from google.genai import types as gt
+        declarations = []
+        for t in TOOLS:
+            props_raw = t.get("parameters", {}).get("properties", {})
+            required  = t.get("parameters", {}).get("required", [])
+            props_sdk = {}
+            for pname, pval in props_raw.items():
+                typ = pval.get("type", "STRING").upper()
+                type_map = {
+                    "STRING": gt.Type.STRING, "BOOLEAN": gt.Type.BOOLEAN,
+                    "INTEGER": gt.Type.INTEGER, "NUMBER": gt.Type.NUMBER,
+                    "OBJECT": gt.Type.OBJECT,  "ARRAY": gt.Type.ARRAY,
+                }
+                props_sdk[pname] = gt.Schema(
+                    type=type_map.get(typ, gt.Type.STRING),
+                    description=pval.get("description", ""),
                 )
-            )
-        return cfg
+            schema = gt.Schema(
+                type=gt.Type.OBJECT,
+                properties=props_sdk,
+                required=required if required else [],
+            ) if props_sdk else gt.Schema(type=gt.Type.OBJECT, properties={})
 
-    # ── Tool router ────────────────────────────────────────────────────────────
-    async def _execute_tool(self, fc) -> types.FunctionResponse:
-        name = fc.name
-        args = dict(fc.args or {})
+            declarations.append(gt.FunctionDeclaration(
+                name=t["name"],
+                description=t["description"],
+                parameters=schema,
+            ))
+        return [gt.Tool(function_declarations=declarations)]
+
+    # ── Execute one tool call ──────────────────────────────────────────────────
+    def _run_tool(self, name: str, args: dict) -> str:
         print(f"[RAHUL] ⚡ Tool: {name}  args={args}")
         self.ui.set_state("THINKING")
         self.ui.notify_tool(name)
-        loop   = asyncio.get_event_loop()
         result = "Done."
-
         try:
             if name == "save_memory":
-                cat, key, val = args.get("category","notes"), args.get("key",""), args.get("value","")
+                cat = args.get("category", "notes")
+                key = args.get("key", "")
+                val = args.get("value", "")
                 if key and val:
                     update_memory({cat: {key: {"value": val}}})
-                if not self.ui.muted:
-                    self.ui.set_state("LISTENING")
-                return types.FunctionResponse(id=fc.id, name=name, response={"result": "ok"})
+                return "Memory saved."
 
             elif name == "shutdown_rahul":
                 self.ui.write_log("SYS: Shutting down RAHUL…")
-                def _exit():
-                    import time, os
-                    time.sleep(1.2)
-                    os._exit(0)
-                threading.Thread(target=_exit, daemon=True).start()
-                result = "Goodbye."
+                def _bye():
+                    import time, os; time.sleep(1.2); os._exit(0)
+                threading.Thread(target=_bye, daemon=True).start()
+                return "Goodbye."
 
-            elif name == "open_app":
-                result = await loop.run_in_executor(None, lambda: open_app(args, self.ui))
+            dispatch = {
+                "open_app":        lambda: open_app(args, self.ui),
+                "web_search":      lambda: web_search_action(args, self.ui),
+                "weather_report":  lambda: weather_action(args, self.ui),
+                "browser_control": lambda: browser_control(args, self.ui),
+                "file_controller": lambda: file_controller(args, self.ui),
+                "code_helper":     lambda: code_helper(args, self.ui),
+                "reminder":        lambda: reminder_action(args, self.ui),
+                "send_message":    lambda: send_message(args, self.ui),
+                "system_control":  lambda: system_control(args, self.ui),
+                "youtube":         lambda: youtube_action(args, self.ui),
+                "news_reader":     lambda: news_reader(args, self.ui),
+                "calculator":      lambda: calculator(args, self.ui),
+                "translate":       lambda: translate_action(args, self.ui),
+                "image_gen":       lambda: image_gen(args, self.ui),
+                "pdf_reader":      lambda: pdf_reader(args, self.ui),
+                "email_action":    lambda: email_action(args, self.ui),
+                "clipboard_mgr":   lambda: clipboard_mgr(args, self.ui),
+                "process_mgr":     lambda: process_mgr(args, self.ui),
+                "network_info":    lambda: network_info(args, self.ui),
+                "animation_engine":lambda: animation_engine(args, self.ui),
+            }
 
-            elif name == "web_search":
-                result = await loop.run_in_executor(None, lambda: web_search_action(args, self.ui))
-
-            elif name == "weather_report":
-                result = await loop.run_in_executor(None, lambda: weather_action(args, self.ui))
-
-            elif name == "browser_control":
-                result = await loop.run_in_executor(None, lambda: browser_control(args, self.ui))
-
-            elif name == "file_controller":
-                result = await loop.run_in_executor(None, lambda: file_controller(args, self.ui))
-
-            elif name == "code_helper":
-                result = await loop.run_in_executor(None, lambda: code_helper(args, self.ui))
-
-            elif name == "screen_process":
+            if name == "screen_process":
                 threading.Thread(
-                    target=screen_process, kwargs={"parameters": args, "player": self.ui},
-                    daemon=True
+                    target=screen_process,
+                    kwargs={"parameters": args, "player": self.ui},
+                    daemon=True,
                 ).start()
-                result = "Vision module activated."
+                return "Vision module activated."
 
-            elif name == "reminder":
-                result = await loop.run_in_executor(None, lambda: reminder_action(args, self.ui))
-
-            elif name == "send_message":
-                result = await loop.run_in_executor(None, lambda: send_message(args, self.ui))
-
-            elif name == "system_control":
-                result = await loop.run_in_executor(None, lambda: system_control(args, self.ui))
-
-            elif name == "youtube":
-                result = await loop.run_in_executor(None, lambda: youtube_action(args, self.ui))
-
-            elif name == "news_reader":
-                result = await loop.run_in_executor(None, lambda: news_reader(args, self.ui))
-
-            elif name == "calculator":
-                result = await loop.run_in_executor(None, lambda: calculator(args, self.ui))
-
-            elif name == "translate":
-                result = await loop.run_in_executor(None, lambda: translate_action(args, self.ui))
-
-            elif name == "image_gen":
-                result = await loop.run_in_executor(None, lambda: image_gen(args, self.ui))
-
-            elif name == "pdf_reader":
-                result = await loop.run_in_executor(None, lambda: pdf_reader(args, self.ui))
-
-            elif name == "email_action":
-                result = await loop.run_in_executor(None, lambda: email_action(args, self.ui))
-
-            elif name == "clipboard_mgr":
-                result = await loop.run_in_executor(None, lambda: clipboard_mgr(args, self.ui))
-
-            elif name == "process_mgr":
-                result = await loop.run_in_executor(None, lambda: process_mgr(args, self.ui))
-
-            elif name == "network_info":
-                result = await loop.run_in_executor(None, lambda: network_info(args, self.ui))
-
-            elif name == "animation_engine":
-                result = await loop.run_in_executor(None, lambda: animation_engine(args, self.ui))
-
+            if name in dispatch:
+                result = dispatch[name]()
             else:
                 result = f"Unknown tool: {name}"
 
         except Exception as e:
-            result = f"Tool '{name}' failed: {e}"
+            result = f"Tool '{name}' error: {e}"
             traceback.print_exc()
-            self.speak_error(name, e)
+            self.ui.write_log(f"ERR: {name} — {str(e)[:100]}")
 
-        if not self.ui.muted:
-            self.ui.set_state("LISTENING")
         print(f"[RAHUL] ✓ {name} → {str(result)[:80]}")
-        return types.FunctionResponse(id=fc.id, name=name, response={"result": str(result)})
+        return str(result)
 
-    # ── Audio tasks (optional) ─────────────────────────────────────────────────
-    async def _send_realtime(self):
-        while True:
-            msg = await self.out_q.get()
-            await self.session.send_realtime_input(media=msg)
+    # ── Main chat turn (runs in background thread) ─────────────────────────────
+    def _chat_turn(self, user_text: str):
+        from google import genai as gai
+        from google.genai import types as gt
 
-    async def _listen_audio(self):
-        SEND_SR, CHANNELS, CHUNK = 16000, 1, 1024
-        loop = asyncio.get_event_loop()
-        def cb(indata, frames, time_info, status):
-            with self._speak_lock:
-                speaking = self._is_speaking
-            if not speaking and not self.ui.muted:
-                loop.call_soon_threadsafe(
-                    self.out_q.put_nowait, {"data": indata.tobytes(), "mime_type": "audio/pcm"}
-                )
-        with self._sd.InputStream(samplerate=SEND_SR, channels=CHANNELS,
-                                   dtype="int16", blocksize=CHUNK, callback=cb):
-            while True:
-                await asyncio.sleep(0.1)
+        api_key = _get_api_key()
+        client  = gai.Client(api_key=api_key)
 
-    async def _receive_audio(self):
-        out_buf, in_buf = [], []
-        while True:
-            async for resp in self.session.receive():
-                if resp.data:
-                    self.audio_q.put_nowait(resp.data)
+        self.ui.set_state("THINKING")
 
-                if resp.server_content:
-                    sc = resp.server_content
-                    if sc.output_transcription and sc.output_transcription.text:
-                        txt = _clean(sc.output_transcription.text)
-                        if txt: out_buf.append(txt)
-                    if sc.input_transcription and sc.input_transcription.text:
-                        txt = _clean(sc.input_transcription.text)
-                        if txt: in_buf.append(txt)
-                    if sc.turn_complete:
-                        if self._turn_ev: self._turn_ev.set()
-                        if in_buf:
-                            self.ui.write_log(f"You: {' '.join(in_buf).strip()}")
-                            in_buf = []
-                        if out_buf:
-                            self.ui.write_log(f"RAHUL: {' '.join(out_buf).strip()}")
-                            out_buf = []
+        with self._lock:
+            # Add user message to history
+            self._history.append(
+                gt.Content(role="user", parts=[gt.Part.from_text(text=user_text)])
+            )
 
-                if resp.tool_call:
-                    frs = []
-                    for fc in resp.tool_call.function_calls:
-                        fr = await self._execute_tool(fc)
-                        frs.append(fr)
-                    await self.session.send_tool_response(function_responses=frs)
+        sys_prompt = self._system_prompt()
+        tools      = self._sdk_tools()
 
-    async def _receive_text(self):
-        """Text-only mode receiver for Gemini Live API."""
-        out_buf = []
-        while True:
-            async for resp in self.session.receive():
-                # Handle text parts
-                if resp.server_content:
-                    sc = resp.server_content
-                    # model_turn contains the actual response parts
-                    if sc.model_turn:
-                        for part in sc.model_turn.parts:
-                            txt = getattr(part, "text", None)
-                            if txt:
-                                out_buf.append(_clean(txt))
-                    if sc.turn_complete:
-                        if self._turn_ev:
-                            self._turn_ev.set()
-                        if out_buf:
-                            full = " ".join(out_buf).strip()
-                            if full:
-                                self.ui.write_log(f"RAHUL: {full}")
-                            out_buf = []
-
-                # Handle tool calls
-                if resp.tool_call:
-                    frs = []
-                    for fc in resp.tool_call.function_calls:
-                        fr = await self._execute_tool(fc)
-                        frs.append(fr)
-                    await self.session.send_tool_response(function_responses=frs)
-
-    async def _play_audio(self):
-        RECV_SR, CHANNELS, CHUNK = 24000, 1, 1024
-        stream = self._sd.RawOutputStream(
-            samplerate=RECV_SR, channels=CHANNELS, dtype="int16", blocksize=CHUNK
-        )
-        stream.start()
-        try:
-            while True:
-                try:
-                    chunk = await asyncio.wait_for(self.audio_q.get(), timeout=0.1)
-                except asyncio.TimeoutError:
-                    if (self._turn_ev and self._turn_ev.is_set()
-                            and self.audio_q.empty()):
-                        self.ui.stop_speaking()
-                        self._turn_ev.clear()
-                    continue
-                self.ui.start_speaking()
-                await asyncio.to_thread(stream.write, chunk)
-        finally:
-            stream.stop(); stream.close()
-
-    # ── Main run loop ──────────────────────────────────────────────────────────
-    async def run(self):
-        client = genai.Client(api_key=_get_api_key(),
-                               http_options={"api_version": "v1alpha"})
+        # Agentic loop — keep calling until no more tool calls
         while True:
             try:
-                print("[RAHUL] Connecting to Gemini…")
-                self.ui.set_state("THINKING")
-                config = self._build_config()
+                with self._lock:
+                    history_snapshot = list(self._history)
 
-                async with client.aio.live.connect(model=LIVE_MODEL, config=config) as session:
-                    self.session = session
-                    self._loop   = asyncio.get_event_loop()
-                    self.audio_q = asyncio.Queue()
-                    self.out_q   = asyncio.Queue(maxsize=10)
-                    self._turn_ev = asyncio.Event()
-
-                    self.ui.set_state("LISTENING")
-                    self.ui.write_log("SYS: RAHUL v3.0 online. Type your command below.")
-
-                    async with asyncio.TaskGroup() as tg:
-                        if self._audio_enabled:
-                            tg.create_task(self._send_realtime())
-                            tg.create_task(self._listen_audio())
-                            tg.create_task(self._receive_audio())
-                            tg.create_task(self._play_audio())
-                        else:
-                            tg.create_task(self._receive_text())
-
+                response = client.models.generate_content(
+                    model=self.MODEL,
+                    contents=history_snapshot,
+                    config=gt.GenerateContentConfig(
+                        system_instruction=sys_prompt,
+                        tools=tools,
+                        temperature=0.7,
+                        max_output_tokens=2048,
+                    ),
+                )
             except Exception as e:
-                print(f"[RAHUL] Error: {e}")
-                traceback.print_exc()
+                self.ui.write_log(f"ERR: Gemini API — {str(e)[:120]}")
+                self.ui.set_state("LISTENING")
+                return
 
-            self.ui.stop_speaking()
-            self.ui.set_state("THINKING")
-            print("[RAHUL] Reconnecting in 3s…")
-            await asyncio.sleep(3)
+            candidate = response.candidates[0] if response.candidates else None
+            if not candidate:
+                self.ui.write_log("ERR: No response from Gemini.")
+                self.ui.set_state("LISTENING")
+                return
+
+            # Collect text + function calls from this response
+            text_parts   = []
+            func_calls   = []
+            for part in candidate.content.parts:
+                if hasattr(part, "text") and part.text:
+                    text_parts.append(_clean(part.text))
+                if hasattr(part, "function_call") and part.function_call:
+                    func_calls.append(part.function_call)
+
+            # Add model response to history
+            with self._lock:
+                self._history.append(candidate.content)
+
+            # Show any text
+            if text_parts:
+                full_text = " ".join(text_parts).strip()
+                if full_text:
+                    self.ui.write_log(f"RAHUL: {full_text}")
+
+            # If no tool calls — we're done
+            if not func_calls:
+                break
+
+            # Execute all tool calls and add results to history
+            tool_response_parts = []
+            for fc in func_calls:
+                t_name = fc.name
+                t_args = dict(fc.args) if fc.args else {}
+                t_result = self._run_tool(t_name, t_args)
+                tool_response_parts.append(
+                    gt.Part.from_function_response(
+                        name=t_name,
+                        response={"result": t_result},
+                    )
+                )
+
+            with self._lock:
+                self._history.append(
+                    gt.Content(role="user", parts=tool_response_parts)
+                )
+
+            # Keep history trimmed to last 40 turns
+            with self._lock:
+                if len(self._history) > 40:
+                    self._history = self._history[-40:]
+
+        self.ui.set_state("LISTENING")
+
+    # ── Called when user types a message ──────────────────────────────────────
+    def _on_text_command(self, text: str):
+        threading.Thread(
+            target=self._chat_turn, args=(text,), daemon=True
+        ).start()
+
+    # ── Startup ───────────────────────────────────────────────────────────────
+    def start(self):
+        """Test connection and announce ready."""
+        self._ready = False
+        self.ui.set_state("THINKING")
+        self.ui.write_log("SYS: Connecting to Gemini 2.0 Flash…")
+
+        def _init():
+            try:
+                from google import genai as gai
+                from google.genai import types as gt
+                client = gai.Client(api_key=_get_api_key())
+                # Quick ping
+                r = client.models.generate_content(
+                    model=self.MODEL,
+                    contents="Say exactly: RAHUL online",
+                    config=gt.GenerateContentConfig(max_output_tokens=10),
+                )
+                self._ready = True
+                self.ui.set_state("LISTENING")
+                self.ui.write_log("SYS: ✓ RAHUL v3.0 online — Type anything below!")
+                self.ui.write_log("SYS: Model: gemini-2.0-flash  |  Free tier ✓")
+            except Exception as e:
+                self.ui.write_log(f"ERR: Cannot connect — {str(e)[:100]}")
+                self.ui.write_log("SYS: Check your API key in config/api_keys.json")
+                self.ui.set_state("INITIALISING")
+
+        threading.Thread(target=_init, daemon=True).start()
 
 
 def main():
@@ -742,10 +679,7 @@ def main():
     def runner():
         ui.wait_for_api_key()
         core = RahulCore(ui)
-        try:
-            asyncio.run(core.run())
-        except KeyboardInterrupt:
-            print("\n[RAHUL] Shutdown.")
+        core.start()
 
     threading.Thread(target=runner, daemon=True).start()
     ui.root.mainloop()
