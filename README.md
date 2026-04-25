@@ -235,14 +235,6 @@ RAHUL/
 ## 📜 License
 
 Personal and non-commercial use only.
-Licensed under [Creative Commons BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/)
-
----
-
-## 🙏 Credits
-
-- Original Jarvis concept by [@FatihMakes](https://www.youtube.com/@FatihMakes)
-- RAHUL v3.0 Linux Edition — Rebuilt with ❤️
 
 ---
 
