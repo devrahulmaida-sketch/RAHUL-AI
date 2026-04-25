@@ -1,0 +1,46 @@
+# RAHUL .gitignore
+
+# API keys and secrets — NEVER commit these
+config/api_keys.json
+config/*.json
+
+# Memory (personal data)
+memory/memory.json
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Temp files
+/tmp/
+*.tmp
+*.log
+
+# Screenshots and generated images
+/tmp/screenshot_*.png
+/tmp/camera_*.jpg
+/tmp/rahul_img_*.png
+
+# OS files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# Playwright
+.playwright/

@@ -1,0 +1,39 @@
+# RAHUL Advanced AI Assistant — Linux Requirements
+# Install with: pip install -r requirements.txt
+
+# Core AI
+google-genai>=1.0.0
+google-generativeai>=0.8.0
+
+# UI
+Pillow>=10.0.0
+
+# Web & Search (FREE — no API key needed)
+duckduckgo-search>=6.0.0
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+
+# Browser automation
+playwright>=1.40.0
+
+# System monitoring
+psutil>=5.9.0
+
+# Translation (FREE)
+deep-translator>=1.11.0
+
+# PDF reading
+pypdf>=4.0.0
+
+# YouTube
+youtube-transcript-api>=0.6.0
+
+# Audio (OPTIONAL — needed only for voice input/output)
+# sounddevice>=0.4.6
+# pyaudio>=0.2.14
+
+# Image processing
+opencv-python>=4.8.0
+
+# Speed test (optional)
+# speedtest-cli>=2.1.3
